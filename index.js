@@ -4,11 +4,10 @@ const qrcode = require('qrcode-terminal');
 const axios = require('axios');
 
 const app = express();
-app.use(express.json()); // body-parser integrado
+app.use(express.json());
 
 let clientReady = false;
 
-// Inicializar cliente de WhatsApp con persistencia de sesión
 const client = new Client({
   authStrategy: new LocalAuth(),
   puppeteer: {
@@ -32,36 +31,26 @@ client.on('disconnected', (reason) => {
   console.error('⚠️ Cliente desconectado:', reason);
 });
 
-// Normaliza números: solo dígitos, debe incluir código de país (e.g. 57 + número en CO)
 function normalizeNumber(raw) {
   if (!raw) return null;
   const digits = String(raw).replace(/\D/g, '');
   return digits.length >= 8 ? digits : null;
 }
 
-// Ruta para enviar mensajes
 app.post('/send-whatsapp', async (req, res) => {
   const { numbers, imageUrl, caption } = req.body;
 
   if (!Array.isArray(numbers) || numbers.length === 0 || !imageUrl) {
     return res.status(400).json({ error: 'Faltan parámetros: numbers[], imageUrl, (caption opcional)' });
   }
-
   if (!clientReady) {
-    return res.status(503).json({ error: 'El cliente de WhatsApp aún no está listo. Intenta de nuevo en unos segundos.' });
+    return res.status(503).json({ error: 'El cliente de WhatsApp aún no está listo.' });
   }
 
   try {
-    // Descargar la imagen desde la URL
-    const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
-    const contentType = response.headers['content-type'] || 'image/jpeg';
-    const ext = contentType.split('/')[1] || 'jpg';
-
-    const media = new MessageMedia(
-      contentType,
-      Buffer.from(response.data).toString('base64'),
-      `publicidad.${ext}`
-    );
+    // 👉 Alternativa más robusta: que wwebjs detecte el mime por sí solo
+    //    (evita problemas de content-type)
+    const media = await MessageMedia.fromUrl(imageUrl, { unsafeMime: true });
 
     const results = [];
     for (const raw of numbers) {
@@ -72,23 +61,47 @@ app.post('/send-whatsapp', async (req, res) => {
       }
 
       try {
-        // Verifica si el número tiene WhatsApp y obtén el ID correcto
         const numberId = await client.getNumberId(normalized);
         if (!numberId) {
           results.push({ number: normalized, status: 'failed', reason: 'El número no tiene WhatsApp' });
           continue;
         }
 
-        await client.sendMessage(numberId._serialized, media, { caption });
-        console.log(`✅ Enviado a: ${normalized}`);
-        results.push({ number: normalized, status: 'sent' });
+        const chatId = numberId._serialized;
+
+        // ✅ 1) Precargar el chat en el store antes de enviar (mitiga el bug)
+        try {
+          await client.getChatById(chatId);
+        } catch (_) {
+          // si falla, no detenemos el flujo; a veces el chat no existe aún
+        }
+
+        try {
+          await client.sendMessage(chatId, media, { caption });
+          console.log(`✅ Enviado a: ${normalized}`);
+          results.push({ number: normalized, status: 'sent' });
+        } catch (err) {
+          // ✅ 2) Si es el bug de serialize/getMessageModel, lo marcamos como enviado con warning
+          const msg = String(err?.message || err);
+          if (msg.includes('getMessageModel') || msg.includes('serialize')) {
+            console.warn(`⚠️ Enviado a ${normalized}, pero con warning de serialize (bug wwebjs)`);
+            results.push({ number: normalized, status: 'sent_with_warning', warning: 'Bug de serialización en wwebjs' });
+          } else {
+            console.error(`❌ Error al enviar a ${normalized}:`, msg);
+            results.push({ number: normalized, status: 'failed', reason: msg });
+          }
+        }
+
+        // Pequeño delay opcional para dar tiempo al store a asentarse
+        await new Promise(r => setTimeout(r, 150));
       } catch (err) {
-        console.error(`❌ Error al enviar a ${normalized}:`, err.message);
-        results.push({ number: normalized, status: 'failed', reason: err.message });
+        const msg = String(err?.message || err);
+        console.error(`❌ Error previo a enviar a ${normalized}:`, msg);
+        results.push({ number: normalized, status: 'failed', reason: msg });
       }
     }
 
-    const sent = results.filter(r => r.status === 'sent').length;
+    const sent = results.filter(r => r.status === 'sent' || r.status === 'sent_with_warning').length;
     const failed = results.filter(r => r.status === 'failed');
 
     res.json({
@@ -101,12 +114,9 @@ app.post('/send-whatsapp', async (req, res) => {
   }
 });
 
-// Iniciar servidor (corrige paréntesis/coma)
 const PORT = 3001;
-// Si realmente necesitas atar a una IP específica:
 app.listen(PORT, '146.190.75.181', () => {
   console.log(`🚀 Servidor escuchando en http://146.190.75.181:${PORT}`);
 });
-// O simplemente: app.listen(PORT, () => { console.log(`http://localhost:${PORT}`) });
 
 client.initialize();
